@@ -15,6 +15,27 @@ const cloudinary = require('cloudinary').v2;
 
 const app = express();
 
+const PORT = process.env.PORT || 3000;
+
+// FRONTEND LOCATION
+// server.js is in /server
+// index.html is in the repository root
+const frontendPath = path.join(__dirname, '..');
+
+const indexPath = path.join(frontendPath, 'index.html');
+const adminPath = path.join(frontendPath, 'admin.html');
+
+// ENVIRONMENT VALIDATION
+if (!process.env.DATABASE_URL) {
+  console.error('ERROR: DATABASE_URL is missing.');
+}
+
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  console.error('ERROR: JWT_SECRET must contain at least 32 characters.');
+  process.exit(1);
+}
+
+// POSTGRESQL DATABASE
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL &&
@@ -23,12 +44,26 @@ const pool = new Pool({
       : false
 });
 
-app.use(helmet({ contentSecurityPolicy: false }));
+pool.on('error', (error) => {
+  console.error('Unexpected PostgreSQL error:', error);
+});
+
+// SECURITY AND REQUEST MIDDLEWARE
+app.disable('x-powered-by');
+
+app.use(helmet({
+  contentSecurityPolicy: false
+}));
+
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-app.use(express.static(path.join(__dirname, '../public')));
+// Serve frontend assets from repository root
+app.use(express.static(frontendPath, {
+  index: false
+}));
 
+// RATE LIMITING
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 30,
@@ -36,8 +71,10 @@ const limiter = rateLimit({
   legacyHeaders: false
 });
 
+app.use('/api/admin/login', limiter);
 app.use('/api/bookings', limiter);
 
+// IMAGE UPLOAD CONFIGURATION
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -45,21 +82,31 @@ const upload = multer({
     files: 4
   },
   fileFilter: (req, file, cb) => {
-    cb(
-      null,
-      ['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype)
-    );
+    const allowed = [
+      'image/jpeg',
+      'image/png',
+      'image/webp'
+    ];
+
+    if (!allowed.includes(file.mimetype)) {
+      return cb(new Error('Only JPG, PNG and WebP images are allowed.'));
+    }
+
+    cb(null, true);
   }
 });
 
+// CLOUDINARY CONFIGURATION
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+// AUTHENTICATION
 function auth(req, res, next) {
   const header = req.headers.authorization || '';
+
   const token = header.startsWith('Bearer ')
     ? header.slice(7)
     : null;
@@ -73,21 +120,27 @@ function auth(req, res, next) {
   try {
     req.admin = jwt.verify(token, process.env.JWT_SECRET);
     next();
-  } catch {
+  } catch (error) {
     return res.status(401).json({
       error: 'Session expired. Please log in again.'
     });
   }
 }
 
+// INPUT CLEANING
 function clean(value, max = 2000) {
   return String(value ?? '').trim().slice(0, max);
 }
 
+// EMAIL NOTIFICATIONS
 async function notify(subject, textBody, to) {
-  if (!process.env.SMTP_HOST ||
-      !process.env.SMTP_USER ||
-      !to) return;
+  if (
+    !process.env.SMTP_HOST ||
+    !process.env.SMTP_USER ||
+    !to
+  ) {
+    return;
+  }
 
   try {
     const transporter = nodemailer.createTransport({
@@ -106,10 +159,35 @@ async function notify(subject, textBody, to) {
       subject,
       text: textBody
     });
+
   } catch (error) {
     console.error('Email notification failed:', error.message);
   }
 }
+
+// ======================================
+// FRONTEND ROUTES
+// ======================================
+
+// MAIN WEBSITE
+app.get('/', (req, res) => {
+  res.sendFile(indexPath);
+});
+
+// ADMIN PAGE
+app.get('/admin', (req, res) => {
+  res.sendFile(adminPath, (error) => {
+    if (error) {
+      res.status(404).send(
+        'Admin page not found. Add admin.html to the repository root.'
+      );
+    }
+  });
+});
+
+// ======================================
+// API ROUTES
+// ======================================
 
 // HEALTH CHECK
 app.get('/api/health', (req, res) => {
@@ -123,11 +201,16 @@ app.get('/api/health', (req, res) => {
 app.get('/api/categories', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT slug,name,description FROM tattoo_categories ORDER BY name'
+      `SELECT slug, name, description
+       FROM tattoo_categories
+       ORDER BY name`
     );
 
     res.json(result.rows);
+
   } catch (error) {
+    console.error('Categories error:', error.message);
+
     res.status(500).json({
       error: 'Could not load categories'
     });
@@ -138,13 +221,17 @@ app.get('/api/categories', async (req, res) => {
 app.get('/api/gallery', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id,category_slug,title,image_url,description,featured
+      `SELECT id, category_slug, title, image_url,
+              description, featured
        FROM tattoo_gallery
-       ORDER BY featured DESC,created_at DESC`
+       ORDER BY featured DESC, created_at DESC`
     );
 
     res.json(result.rows);
+
   } catch (error) {
+    console.error('Gallery error:', error.message);
+
     res.status(500).json({
       error: 'Could not load gallery'
     });
@@ -155,22 +242,28 @@ app.get('/api/gallery', async (req, res) => {
 app.get('/api/testimonials', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id,display_name,country,rating,review
+      `SELECT id, display_name, country, rating, review
        FROM testimonials
-       WHERE approved=true
+       WHERE approved = true
        ORDER BY created_at DESC
        LIMIT 30`
     );
 
     res.json(result.rows);
+
   } catch (error) {
+    console.error('Testimonials error:', error.message);
+
     res.status(500).json({
       error: 'Could not load reviews'
     });
   }
 });
 
-// CUSTOMER BOOKING
+// ======================================
+// CUSTOMER APPOINTMENT BOOKING
+// ======================================
+
 app.post(
   '/api/bookings',
   upload.array('reference_images', 4),
@@ -195,7 +288,11 @@ app.post(
         }
       }
 
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean(b.email, 254))) {
+      if (
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
+          clean(b.email, 254)
+        )
+      ) {
         return res.status(400).json({
           error: 'Enter a valid email address.'
         });
@@ -204,7 +301,15 @@ app.post(
       let images = [];
 
       for (const file of req.files || []) {
-        if (!process.env.CLOUDINARY_CLOUD_NAME) continue;
+        if (
+          !process.env.CLOUDINARY_CLOUD_NAME ||
+          !process.env.CLOUDINARY_API_KEY ||
+          !process.env.CLOUDINARY_API_SECRET
+        ) {
+          return res.status(503).json({
+            error: 'Image uploads are not configured yet.'
+          });
+        }
 
         const result = await new Promise((resolve, reject) => {
           const stream = cloudinary.uploader.upload_stream(
@@ -225,12 +330,13 @@ app.post(
       }
 
       const reference =
-        'DSN-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+        'DSN-' +
+        crypto.randomBytes(4).toString('hex').toUpperCase();
 
       const values = [
         reference,
         clean(b.full_name, 120),
-        clean(b.email, 254),
+        clean(b.email, 254).toLowerCase(),
         clean(b.phone, 40),
         clean(b.country, 80),
         clean(b.city, 100),
@@ -251,10 +357,10 @@ app.post(
 
       await pool.query(
         `INSERT INTO appointment_requests(
-          reference,full_name,email,phone,country,city,
-          contact_method,category,description,placement,size,
-          style,ink_type,preferred_date,preferred_time,timezone,
-          budget,reference_images,additional_info
+          reference, full_name, email, phone, country, city,
+          contact_method, category, description, placement, size,
+          style, ink_type, preferred_date, preferred_time, timezone,
+          budget, reference_images, additional_info
         )
         VALUES(
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
@@ -265,18 +371,21 @@ app.post(
 
       await notify(
         'New DARKSIDE_NEEDLE appointment request',
-        `New request ${reference}\n${values[1]} (${values[2]})\n${values[7]} - ${values[8]}`,
+        `New request ${reference}\n` +
+        `${values[1]} (${values[2]})\n` +
+        `${values[7]} - ${values[8]}`,
         process.env.ADMIN_NOTIFY_EMAIL
       );
 
       res.status(201).json({
         ok: true,
         reference,
-        message: 'Your request has been received. It is not confirmed until the studio contacts you.'
+        message:
+          'Your request has been received. It is not confirmed until the studio contacts you.'
       });
 
     } catch (error) {
-      console.error(error);
+      console.error('Booking error:', error);
 
       res.status(500).json({
         error: 'Unable to submit your request. Please try again.'
@@ -285,20 +394,34 @@ app.post(
   }
 );
 
+// ======================================
 // ADMIN LOGIN
-app.post('/api/admin/login', limiter, async (req, res) => {
+// ======================================
+
+app.post('/api/admin/login', async (req, res) => {
   try {
     const email = clean(req.body.email, 254).toLowerCase();
     const password = String(req.body.password || '');
 
+    if (!email || !password) {
+      return res.status(400).json({
+        error: 'Email and password are required.'
+      });
+    }
+
     const result = await pool.query(
-      'SELECT id,email,password_hash FROM administrators WHERE email=$1',
+      `SELECT id, email, password_hash
+       FROM administrators
+       WHERE email = $1`,
       [email]
     );
 
     if (
       !result.rowCount ||
-      !await bcrypt.compare(password, result.rows[0].password_hash)
+      !await bcrypt.compare(
+        password,
+        result.rows[0].password_hash
+      )
     ) {
       return res.status(401).json({
         error: 'Invalid email or password'
@@ -320,28 +443,41 @@ app.post('/api/admin/login', limiter, async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Admin login error:', error.message);
+
     res.status(500).json({
       error: 'Login failed'
     });
   }
 });
 
+// ======================================
 // ADMIN VIEW BOOKINGS
+// ======================================
+
 app.get('/api/admin/bookings', auth, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM appointment_requests ORDER BY created_at DESC'
+      `SELECT *
+       FROM appointment_requests
+       ORDER BY created_at DESC`
     );
 
     res.json(result.rows);
+
   } catch (error) {
+    console.error('Admin bookings error:', error.message);
+
     res.status(500).json({
       error: 'Could not load bookings'
     });
   }
 });
 
+// ======================================
 // ADMIN UPDATE BOOKING STATUS
+// ======================================
+
 app.patch('/api/admin/bookings/:id', auth, async (req, res) => {
   const allowed = [
     'New Request',
@@ -365,8 +501,8 @@ app.patch('/api/admin/bookings/:id', auth, async (req, res) => {
   try {
     const result = await pool.query(
       `UPDATE appointment_requests
-       SET status=$1,updated_at=NOW()
-       WHERE id=$2
+       SET status = $1, updated_at = NOW()
+       WHERE id = $2
        RETURNING *`,
       [status, req.params.id]
     );
@@ -380,8 +516,10 @@ app.patch('/api/admin/bookings/:id', auth, async (req, res) => {
     const booking = result.rows[0];
 
     await pool.query(
-      `INSERT INTO admin_activity_logs(admin_id,action,details)
-       VALUES($1,$2,$3::jsonb)`,
+      `INSERT INTO admin_activity_logs(
+        admin_id, action, details
+      )
+      VALUES($1, $2, $3::jsonb)`,
       [
         req.admin.id,
         'booking_status_updated',
@@ -394,37 +532,55 @@ app.patch('/api/admin/bookings/:id', auth, async (req, res) => {
 
     await notify(
       `DARKSIDE_NEEDLE booking update: ${status}`,
-      `Hello ${booking.full_name}, your request ${booking.reference} is now: ${status}. The studio will contact you with next steps.`,
+      `Hello ${booking.full_name}, your request ` +
+      `${booking.reference} is now: ${status}. ` +
+      `The studio will contact you with next steps.`,
       booking.email
     );
 
     res.json(booking);
 
   } catch (error) {
+    console.error('Update booking error:', error.message);
+
     res.status(500).json({
       error: 'Could not update booking'
     });
   }
 });
 
+// ======================================
 // ADMIN DELETE BOOKING
+// ======================================
+
 app.delete('/api/admin/bookings/:id', auth, async (req, res) => {
   try {
-    await pool.query(
-      'DELETE FROM appointment_requests WHERE id=$1',
+    const result = await pool.query(
+      'DELETE FROM appointment_requests WHERE id = $1',
       [req.params.id]
     );
+
+    if (!result.rowCount) {
+      return res.status(404).json({
+        error: 'Booking not found'
+      });
+    }
 
     res.json({ ok: true });
 
   } catch (error) {
+    console.error('Delete booking error:', error.message);
+
     res.status(500).json({
       error: 'Could not delete booking'
     });
   }
 });
 
+// ======================================
 // ADMIN UPLOAD GALLERY IMAGE
+// ======================================
+
 app.post(
   '/api/admin/gallery',
   auth,
@@ -437,15 +593,21 @@ app.post(
         });
       }
 
-      if (!process.env.CLOUDINARY_CLOUD_NAME) {
-        return res.status(400).json({
+      if (
+        !process.env.CLOUDINARY_CLOUD_NAME ||
+        !process.env.CLOUDINARY_API_KEY ||
+        !process.env.CLOUDINARY_API_SECRET
+      ) {
+        return res.status(503).json({
           error: 'Configure Cloudinary before uploading images'
         });
       }
 
       const output = await new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
-          { folder: 'darkside-needle/gallery' },
+          {
+            folder: 'darkside-needle/gallery'
+          },
           (error, result) => {
             if (error) reject(error);
             else resolve(result);
@@ -457,7 +619,8 @@ app.post(
 
       const result = await pool.query(
         `INSERT INTO tattoo_gallery(
-          category_slug,title,image_url,description,featured
+          category_slug, title, image_url,
+          description, featured
         )
         VALUES($1,$2,$3,$4,$5)
         RETURNING *`,
@@ -473,6 +636,8 @@ app.post(
       res.status(201).json(result.rows[0]);
 
     } catch (error) {
+      console.error('Gallery upload error:', error.message);
+
       res.status(500).json({
         error: 'Image upload failed'
       });
@@ -480,31 +645,51 @@ app.post(
   }
 );
 
+// ======================================
 // ADMIN DELETE GALLERY IMAGE
+// ======================================
+
 app.delete('/api/admin/gallery/:id', auth, async (req, res) => {
   try {
-    await pool.query(
-      'DELETE FROM tattoo_gallery WHERE id=$1',
+    const result = await pool.query(
+      'DELETE FROM tattoo_gallery WHERE id = $1',
       [req.params.id]
     );
+
+    if (!result.rowCount) {
+      return res.status(404).json({
+        error: 'Gallery image not found'
+      });
+    }
 
     res.json({ ok: true });
 
   } catch (error) {
+    console.error('Delete gallery error:', error.message);
+
     res.status(500).json({
       error: 'Could not delete image'
     });
   }
 });
 
+// ======================================
 // ADMIN ADD TESTIMONIAL
+// ======================================
+
 app.post('/api/admin/testimonials', auth, async (req, res) => {
   try {
     const b = req.body;
 
+    if (!clean(b.display_name) || !clean(b.review)) {
+      return res.status(400).json({
+        error: 'Name and review are required.'
+      });
+    }
+
     const result = await pool.query(
       `INSERT INTO testimonials(
-        display_name,country,rating,review,approved
+        display_name, country, rating, review, approved
       )
       VALUES($1,$2,$3,$4,$5)
       RETURNING *`,
@@ -520,25 +705,50 @@ app.post('/api/admin/testimonials', auth, async (req, res) => {
     res.status(201).json(result.rows[0]);
 
   } catch (error) {
+    console.error('Add testimonial error:', error.message);
+
     res.status(500).json({
       error: 'Could not save testimonial'
     });
   }
 });
 
-// ADMIN PAGE
-app.get('/admin', (req, res) => {
-  res.sendFile(path.join(__dirname, '../public/admin.html'));
+// ======================================
+// API NOT FOUND
+// ======================================
+
+app.use('/api', (req, res) => {
+  res.status(404).json({
+    error: 'API endpoint not found'
+  });
 });
 
-// WEBSITE HOMEPAGE
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../public/index.html'));
+// ======================================
+// WEBSITE PAGE NOT FOUND
+// ======================================
+
+app.use((req, res) => {
+  res.status(404).send('Page not found');
 });
 
+// ERROR HANDLER
+app.use((error, req, res, next) => {
+  console.error('Server error:', error.message);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  res.status(400).json({
+    error: error.message || 'Something went wrong.'
+  });
+});
+
+// ======================================
 // START SERVER
-const port = process.env.PORT || 3000;
+// ======================================
 
-app.listen(port, () => {
-  console.log(`DARKSIDE_NEEDLE running on port ${port}`);
+app.listen(PORT, () => {
+  console.log(`DARKSIDE_NEEDLE running on port ${PORT}`);
+  console.log(`Frontend location: ${indexPath}`);
 });
